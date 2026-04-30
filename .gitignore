@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Workspace data — personal todos and saved conversations
+# The workspace lives outside the repo (C:\Users\ethan\assistant_workspace)
+# but in case it ever moves here, exclude it
+assistant_workspace/
+*.json
+
+# Saved conversations
+conversations/
+*.txt.bak
+
+# Sensitive config (API keys, personal settings overrides)
+config/local_settings.py
+.env
+*.env
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

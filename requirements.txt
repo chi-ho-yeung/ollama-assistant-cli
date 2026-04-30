@@ -1,0 +1,8 @@
+# Core agent framework
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-ollama>=0.2.0
+langgraph>=1.0.0
+
+# Web search (no API key needed)
+ddgs>=1.0.0
