@@ -36,6 +36,7 @@ except ImportError:
     missing.append("langgraph")
 try:
     from langchain_core.messages import HumanMessage, AIMessage
+    from langchain_core.runnables import RunnableSerializable
 except ImportError:
     missing.append("langchain-core")
 
@@ -182,19 +183,74 @@ def compact_todo_context(agent, thread_config):
         pass  # compaction is best-effort — never crash the main loop
 
 
+def estimate_tokens(messages: list) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    total = 0
+    for msg in messages:
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        total += len(content) // 4
+    return total
+
+
+class NoThinkWrapper(RunnableSerializable):
+    """
+    Wraps ChatOllama to prepend /no_think into the last human or tool message
+    of every LLM call. This suppresses qwen3 reasoning on all internal agent
+    calls (tool decision, response formatting) without modifying user-visible
+    message content. summarize_with_thinking bypasses this wrapper entirely
+    by calling the underlying llm directly with reasoning=True.
+    """
+    _llm: object = None
+
+    def __init__(self, inner_llm):
+        super().__init__()
+        object.__setattr__(self, "_llm", inner_llm)
+
+    def __getattr__(self, name):
+        return getattr(self._llm, name)
+
+    def _inject(self, messages):
+        from langchain_core.messages import HumanMessage as HM, ToolMessage
+        msgs = list(messages)
+        for i in reversed(range(len(msgs))):
+            if isinstance(msgs[i], (HM, ToolMessage)):
+                original = msgs[i].content if isinstance(msgs[i].content, str) else ""
+                if not original.startswith("/no_think"):
+                    msgs[i] = msgs[i].model_copy(update={"content": "/no_think " + original})
+                break
+        return msgs
+
+    def invoke(self, messages, config=None, **kwargs):
+        if kwargs.get("reasoning"):
+            return self._llm.invoke(messages, **kwargs)
+        return self._llm.invoke(self._inject(messages), config=config, **kwargs)
+
+    def stream(self, messages, config=None, **kwargs):
+        return self._llm.stream(self._inject(messages), config=config, **kwargs)
+
+    def bind_tools(self, tools, **kwargs):
+        return NoThinkWrapper(self._llm.bind_tools(tools, **kwargs))
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Personal Assistant CLI")
     parser.add_argument("--model", type=str, default=MODEL, help=f"Ollama model to use (default: {MODEL})")
-    parser.add_argument("--think", action="store_true", help="Enable thinking mode (slower, shows reasoning)")
     args = parser.parse_args()
     
     print_banner(args.model)
     print(f"{C.DIM}Give me a minute while I start the LLM and pull your to-dos...{C.RESET}\n")
 
     try:
-        llm = ChatOllama(model=args.model, temperature=0.7, thinking=args.think)
+        # qwen3 supports /no_think token to suppress reasoning for faster responses.
+        # Thinking is disabled by default; only summarize_with_thinking uses it explicitly.
+        is_qwen3 = "qwen3" in args.model.lower()
+        llm_kwargs = {"model": args.model, "temperature": 0.7}
+        llm = ChatOllama(**llm_kwargs)
+        if is_qwen3:
+            llm = NoThinkWrapper(llm)
+        active_tools = tools
     except Exception as e:
         print(f"\n{C.RED}Error: Could not connect to Ollama.\n{e}{C.RESET}")
         print("Make sure Ollama is running:  ollama serve")
@@ -208,11 +264,13 @@ def main():
     with open("system_prompt.txt", "r") as f:
         prompt_template = f.read()
     system_prompt = prompt_template.format(ASSISTANT_NAME=ASSISTANT_NAME, WORKSPACE_DIR=WORKSPACE_DIR)
+    if is_qwen3:
+        system_prompt = "/no_think\n" + system_prompt
 
     memory = MemorySaver()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        agent = create_react_agent(llm, tools, checkpointer=memory, prompt=system_prompt)
+        agent = create_react_agent(llm, active_tools, checkpointer=memory, prompt=system_prompt)
     thread_config = {"configurable": {"thread_id": "main-session"}}
     conversation_messages = []
 
@@ -241,12 +299,12 @@ def main():
                 if "messages" in output:
                     msg = output["messages"][-1]
                     if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        print(f"\n{C.DIM}  > Using tool: {msg.tool_calls[0]['name']}...{C.RESET}")
+                        tool_name = msg.tool_calls[0]['name']
+                        print(f"\n{C.DIM}  > Using tool: {tool_name}...{C.RESET}")
                         print(f"{C.BOLD}{C.MAGENTA}{ASSISTANT_NAME}:{C.RESET} ", end="", flush=True)
                     elif isinstance(msg, AIMessage):
                         print_thinking(msg)
-                        clean = msg.content
-                        import re; clean = re.sub(r"<think>.*?</think>", "", clean, flags=re.DOTALL).strip()
+                        clean = re.sub(r"<think>.*?</think>", "", msg.content, flags=re.DOTALL).strip()
                         if clean:
                             print(clean, end="", flush=True)
                             last_startup_content = clean
@@ -258,25 +316,58 @@ def main():
         print(f"\n{C.RED}(Could not load todos on startup: {e}){C.RESET}\n")
 
     # ── Input queue ───────────────────────────────────────────────────────────
-    # A background thread collects user input into a queue so the user can
-    # type while Aria is working. Queued lines are processed in order.
+    # Uses msvcrt on Windows for true non-blocking key reading so the user can
+    # type while Aria is working. Characters are buffered into lines and queued.
     input_queue = queue.Queue()
-    input_prompt_event = threading.Event()  # signals the reader to show "You:"
+    cancel_event = threading.Event()        # signals the agent loop to stop mid-stream
+    _input_buf = []
+    _prompt_shown = threading.Event()
 
     def input_reader():
+        """Read keyboard input character by character (non-blocking on Windows)."""
+        import msvcrt
+        # Show initial prompt
+        print(f"{C.BOLD}{C.BLUE}You:{C.RESET} ", end="", flush=True)
+        _prompt_shown.set()
         while True:
-            input_prompt_event.wait()          # wait until we want a prompt
-            input_prompt_event.clear()
             try:
-                line = input(f"{C.BOLD}{C.BLUE}You:{C.RESET} ").strip()
-            except (KeyboardInterrupt, EOFError):
-                input_queue.put(None)          # sentinel → exit
-                return
-            input_queue.put(line)
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwche()  # echo character immediately
+                    if ch in ('\r', '\n'):  # Enter
+                        print()  # newline after enter
+                        line = "".join(_input_buf).strip()
+                        _input_buf.clear()
+                        if line:
+                            # /stop and /cancel are handled immediately — set cancel flag right here
+                            if line.lower() in ("/stop", "/cancel"):
+                                cancel_event.set()
+                                print(f"{C.YELLOW}(cancelling...){C.RESET}")
+                            else:
+                                input_queue.put(line)
+                        # Only show next prompt if agent is idle (queue empty and not working)
+                        # The main loop will re-show the prompt after processing
+                    elif ch == '\x1b':  # Escape — cancel current request
+                        cancel_event.set()
+                        _input_buf.clear()
+                        print(f"\n{C.YELLOW}(cancelling...){C.RESET}")
+                    elif ch == '\x03':  # Ctrl+C
+                        input_queue.put(None)
+                        return
+                    elif ch == '\x08':  # Backspace
+                        if _input_buf:
+                            _input_buf.pop()
+                            # Erase character on terminal
+                            print(' \b', end="", flush=True)
+                    elif ch >= ' ':  # printable characters only
+                        _input_buf.append(ch)
+                else:
+                    time.sleep(0.05)  # small sleep to avoid busy-waiting
+            except Exception:
+                time.sleep(0.05)
 
     reader_thread = threading.Thread(target=input_reader, daemon=True)
     reader_thread.start()
-    input_prompt_event.set()                   # show the first "You:" prompt
+    _prompt_shown.wait()  # wait for first "You: " to appear before agent starts
 
     while True:
         # Drain any queued inputs first, then block for the next one
@@ -309,6 +400,7 @@ def main():
 
         conversation_messages.append(HumanMessage(content=user_input))
 
+        cancel_event.clear()  # reset before each new request
         try:
             # Start timer thread
             stop_timer = threading.Event()
@@ -320,25 +412,35 @@ def main():
             # Keep track of whether we've printed the assistant's name prefix
             prefix_printed = False
             last_message_content = ""
+            tool_call_count = 0
+            MAX_TOOL_CALLS = 5  # prevent infinite tool-call loops
             
             for event in agent.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=thread_config,
                 stream_mode="updates"
             ):
+                if cancel_event.is_set():
+                    print(f"\n{C.YELLOW}(cancelled){C.RESET}\n")
+                    break
                 for node_name, output in event.items():
                     if "messages" in output:
                         msg = output["messages"][-1]
                         
                         # Handle tool calls
                         if hasattr(msg, "tool_calls") and msg.tool_calls:
-                             print(f"\n{C.DIM}  > Using tool: {msg.tool_calls[0]['name']}...{C.RESET}")
+                             tool_call_count += 1
+                             if tool_call_count > MAX_TOOL_CALLS:
+                                 print(f"\n{C.YELLOW}(too many tool calls — stopping to avoid a loop){C.RESET}\n")
+                                 cancel_event.set()
+                                 break
+                             tool_name = msg.tool_calls[0]['name']
+                             print(f"\n{C.DIM}  > Using tool: {tool_name}...{C.RESET}")
                              prefix_printed = False 
                         
                         # Handle actual assistant text
                         elif isinstance(msg, AIMessage):
                              print_thinking(msg)
-                             import re
                              clean = re.sub(r"<think>.*?</think>", "", msg.content, flags=re.DOTALL).strip()
                              if clean:
                                  if not prefix_printed:
@@ -350,9 +452,11 @@ def main():
             # Stop timer thread
             stop_timer.set()
             
-            # End timing
+            # End timing and show context size
             elapsed = time.time() - start_time
-            print(f"\n{C.DIM}({elapsed:.1f}s){C.RESET}\n")
+            ctx_tokens = estimate_tokens(conversation_messages)
+            ctx_pct = int((ctx_tokens / 32768) * 100)
+            print(f"\n{C.DIM}({elapsed:.1f}s | ctx: ~{ctx_tokens:,} tokens / 32k — {ctx_pct}%){C.RESET}\n")
             
             conversation_messages.append(AIMessage(content=last_message_content))
 
@@ -371,8 +475,8 @@ def main():
             if "connection" in str(e).lower() or "refused" in str(e).lower():
                 print(f"{C.DIM}Is Ollama still running? Try: ollama serve{C.RESET}\n")
 
-        # Ready for next input — show prompt and queue the next line
-        input_prompt_event.set()
+        # Re-show the You: prompt after response
+        print(f"{C.BOLD}{C.BLUE}You:{C.RESET} {''.join(_input_buf)}", end="", flush=True)
 
 
 if __name__ == "__main__":

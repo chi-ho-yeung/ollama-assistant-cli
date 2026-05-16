@@ -4,9 +4,8 @@
 # ─────────────────────────────────────────────
 
 # Ollama model to use
-# Default: "qwen2.5:3b-instruct"
-# Available: "qwen3:4b", "qwen2.5:3b-instruct", "llama3.2:3b-instruct-q4_1"
-MODEL = "qwen2.5:7b-instruct"
+# Available: "qwen3.5:4b", "qwen2.5:3b-instruct", "llama3.2:3b-instruct-q4_1"
+MODEL = "qwen3.5:4b"
 
 # Assistant name shown in the terminal
 ASSISTANT_NAME = "Aria"

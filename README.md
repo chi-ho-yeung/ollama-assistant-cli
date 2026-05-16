@@ -25,7 +25,7 @@ The answer is yes — but only with the right model and careful prompt engineeri
 - 💬 **Persistent conversation history** — context is maintained across turns in a session
 - ⌨️ **Input queuing** — type your next request while the model is still working
 - ⏱️ **Progress indicator** — "Still working..." shown every 15 seconds for long operations
-- 🔧 **`--think` flag** — enables reasoning output for models that support it (e.g. qwen3)
+- 🚫 **No-think mode** — `/no_think` is injected automatically for qwen3-series models, suppressing reasoning for faster responses
 
 ---
 
@@ -35,12 +35,28 @@ Finding the right model for tool calling on constrained hardware took significan
 
 | Model | Result |
 |---|---|
-| `qwen2.5:7b-instruct` ✅ | **Recommended.** Best balance of speed, tool-call precision, and instruction following |
+| `qwen3.5:4b` ✅ | **Current.** Better formatting quality than qwen2.5 variants; reliable tool calling in no-think mode |
+| `qwen2.5:7b-instruct` ✅ | Good alternative. Strong instruction following; slightly less natural output formatting |
 | `qwen2.5:3b-instruct` ⚠️ | Too small — imprecise tool call formatting, struggles to follow system prompts consistently |
 | `qwen2.5-coder:7b` ⚠️ | Coder variant lacks the instruction-following precision needed for tool calling |
-| `qwen3:4b` / `qwen3.5` ❌ | Thinking overhead makes responses too slow for interactive use on this hardware |
 
-**Key insight:** For agentic applications on constrained hardware, model *precision* matters more than raw size. A well-tuned 7B instruct model outperforms larger or specialized variants for tool-calling tasks.
+**Key insight:** For agentic applications on constrained hardware, model *precision* matters more than raw size. A well-tuned small instruct model with `/no_think` suppression outperforms larger or specialized variants for tool-calling tasks.
+
+---
+
+## Thinking Mode
+
+`qwen3.5` and other qwen3-series models support a hybrid thinking/non-thinking mode. **On this hardware (2GB VRAM, MX450), thinking mode is not recommended:**
+
+- The model produces `<think>...</think>` reasoning blocks before answering
+- On a 4b model, the reasoning budget is limited — it rarely produces better answers than no-think mode, especially for simple tasks like formatting a todo list or summarizing text
+- Response time increases ~30% (90s → 120s for a startup todo list)
+- The 4b model occasionally exhausts itself during the reasoning pass and outputs an empty response, requiring a retry
+- The `/no_think` token is injected into every agent LLM call via `NoThinkWrapper` — this covers all internal agent calls (tool decision + response formatting), not just the user-visible message
+
+**Thinking mode is worth exploring on better hardware** (dedicated GPU with 6GB+ VRAM, or a larger model like 9b+). On such hardware, thinking provides meaningful quality improvements for complex reasoning tasks — planning, multi-step logic, ambiguous instructions. For simple CRUD operations and formatting, even then the gain is marginal.
+
+The codebase has full thinking-mode infrastructure (`NoThinkWrapper`, `/no_think` injection, `--think` flag history) that can be re-enabled when hardware permits.
 
 ---
 
@@ -73,8 +89,7 @@ python assistant.py
 ### Options
 
 ```bash
-python assistant.py --model qwen2.5:7b-instruct   # override model
-python assistant.py --think                        # enable reasoning output (qwen3+ only)
+python assistant.py --model qwen3.5:4b   # override model
 ```
 
 ### Commands

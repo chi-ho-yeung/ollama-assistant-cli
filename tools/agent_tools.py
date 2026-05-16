@@ -9,12 +9,10 @@ import json
 import datetime
 from langchain.tools import tool
 from ddgs import DDGS
-from langchain_ollama import OllamaLLM
 
 try:
-    from config.settings import MODEL, WORKSPACE_DIR, SEARCH_RESULTS, SCRIPT_TIMEOUT
+    from config.settings import WORKSPACE_DIR, SEARCH_RESULTS, SCRIPT_TIMEOUT
 except ImportError:
-    MODEL = "qwen3:4b"
     WORKSPACE_DIR = os.path.join(os.path.expanduser("~"), "assistant_workspace")
     SEARCH_RESULTS = 5
     SCRIPT_TIMEOUT = 30
@@ -218,29 +216,26 @@ def web_search(query: str) -> str:
             url = r.get("href", "")
             snippet = r.get("body", "")[:250]
             lines.append(f"{i}. {title}\n   {url}\n   {snippet}\n")
+
+        # Print URLs to terminal so user can see what was searched
+        print(f"\033[2m  > Results from:\033[0m")
+        for r in results:
+            print(f"\033[2m    {r.get('href', '')}\033[0m")
+
+        # Log the query and URLs to the workspace search log
+        try:
+            log_path = os.path.join(WORKSPACE_DIR, "search_log.md")
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n## {ts} — {query}\n")
+                for r in results:
+                    f.write(f"- [{r.get('title','No title')}]({r.get('href','')})\n")
+        except Exception:
+            pass  # logging is best-effort, never crash the search
+
         return "\n".join(lines)
     except Exception as e:
         return f"Error searching web: {e}"
-
-
-# ── Summarize Tool ────────────────────────────────────────────────────────────
-
-@tool
-def summarize(text: str) -> str:
-    """Summarize a long block of text using the local Ollama model.
-    Args:
-        text: Text to summarize.
-    """
-    try:
-        llm = OllamaLLM(model=MODEL)
-        prompt = (
-            "Summarize the following text clearly and concisely. "
-            "Focus on the key points.\n\n"
-            f"{text}\n\nSummary:"
-        )
-        return llm.invoke(prompt)
-    except Exception as e:
-        return f"Error summarizing (is Ollama running with '{MODEL}'?): {e}"
 
 
 @tool
@@ -294,7 +289,9 @@ def manage_todo(action: str, title: str = None, notes: str = None, due: str = No
         incomplete = [t for t in todos if not t['completed']]
         incomplete.sort(key=lambda x: x.get('order', 99999))
         if not incomplete: return "No incomplete todos."
-        return json.dumps(incomplete, indent=2)
+        # Return only the fields the LLM needs to display the list
+        slim = [{"order": t["order"], "title": t["title"], "due": t.get("due", "")} for t in incomplete]
+        return json.dumps(slim)
 
     elif action in ("complete", "delete"):
         # Normalise: accept todo_id or todo_ids
@@ -348,6 +345,5 @@ tools = [
     list_workspace,
     run_script,
     web_search,
-    summarize,
     manage_todo,
 ]
