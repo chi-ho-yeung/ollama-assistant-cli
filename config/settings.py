@@ -4,8 +4,10 @@
 # ─────────────────────────────────────────────
 
 # Ollama model to use
-# Available: "qwen3.5:4b", "qwen2.5:3b-instruct", "llama3.2:3b-instruct-q4_1"
-MODEL = "qwen3.5:4b"
+# Available: "phi4-mini:3.8b", "qwen3.5:4b", "qwen2.5:3b-instruct", "llama3.2:3b-instruct-q4_1"
+#MODEL = "granite4.1:3b"
+#MODEL = "ministral-3:3b"
+MODEL = "lfm2.5:8b"
 
 # Assistant name shown in the terminal
 ASSISTANT_NAME = "Aria"

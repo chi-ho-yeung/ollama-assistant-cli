@@ -132,12 +132,30 @@ WORKSPACE_DIR = r"C:\Users\yourname\assistant_workspace"
 
 Context efficiency is a core design goal. Small local LLMs have limited context windows, and filling them with stale history degrades response quality and speed.
 
-This app uses a **32k context window** (configured in Ollama) and manages it actively:
+This app explicitly sets `num_ctx=8192` (8k tokens) on every Ollama request. This is a deliberate performance choice — the default context window for qwen3-series models is 32k, which forces Ollama to allocate a much larger KV cache in VRAM at model load time even for short conversations. Fixing it at 8k reduces that allocation significantly, cutting first-request latency. 8k is more than sufficient for typical assistant chat sessions.
+
+Context is also managed actively:
 
 - **Todo state compaction** — after every turn, all `manage_todo` tool call/result message pairs in LangGraph memory are replaced with a single concise snapshot of the current todo list. The model never needs to re-read the full history of how the list changed — only what it looks like now.
 - **Conversation trimming** — general conversation history is capped at `MAX_HISTORY` turns, keeping the oldest exchanges from filling the window.
 - **Narrow tool scope** — tools are purpose-built and return minimal JSON, not verbose prose, so tool results consume as few tokens as possible.
+
 The goal: at any point in a session, the context window contains the system prompt, the current todo state (one snapshot), and recent conversation — nothing more.
+
+### Structured Output for Startup Todo Display
+
+On startup, the assistant displays your current todo list using **LangChain's `.with_structured_output()`** rather than routing through the full ReAct agent loop.
+
+The original approach sent a prompt through the agent, which required the model to: (1) decide to call the `manage_todo` tool, (2) call it, (3) format the result as readable output — three LLM steps, all unreliable on small models. Small local models frequently struggle with the ReAct loop: they may call the wrong tool, misformat the JSON, or produce empty output after exhausting themselves during reasoning.
+
+The refactored approach:
+1. Calls `manage_todo` directly in Python — no LLM involvement for data fetching
+2. Parses the raw JSON directly into Python lists and dictionaries
+3. Renders them with a deterministic formatter
+
+This is faster (one Python call instead of multiple LLM round-trips), more reliable, and produces consistent output regardless of model quality.
+
+Note: `.with_structured_output()` itself (which asks the LLM to emit JSON matching a schema) was evaluated but found to hang or produce garbage on small models like `qwen3.5:2b`. The final implementation avoids calling the LLM at all for startup todo rendering.
 
 ### Performance
 
@@ -192,6 +210,66 @@ This project is in early stages. Planned features:
 - **Goal breakdown** — given a task, suggest concrete steps to accomplish it
 - **Monthly summary** — review and summarize tasks completed in the past month
 - **Multi-session memory** — persist context across separate runs, not just within a session
+
+---
+
+## Next Steps
+
+The current architecture relies on the LLM to orchestrate multi-step flows (clarify → execute → validate → display). This works but is fragile on small models — they lose track of the sequence, skip steps, or echo raw JSON instead of a formatted response. The next phase replaces that with an explicit state machine built in LangGraph, where the model only handles the reasoning steps it's actually good at.
+
+### Architecture: LangGraph State Machine
+
+Rather than one agent loop that tries to do everything, each stage of a request becomes a dedicated node. The model participates only where judgment is needed; everything else is deterministic Python.
+
+**Graph structure:**
+
+```
+[parse_intent]
+      ↓
+[clarify?] ──── needs info ────→ [ask_clarification] → (wait for user) → [parse_intent]
+      ↓ has enough
+[execute_tool]
+      ↓
+[validate]
+      ↓
+[validated?] ── mismatch ──→ [fix_attempt] → [execute_tool]
+      ↓ correct              (max retries → [report_failure])
+[display_result]
+```
+
+**What each node does:**
+
+- **`parse_intent`** — LLM call with a tight prompt; returns structured JSON: action, target_id, missing fields, ambiguity flag. This is a classification task — well within small model capability.
+- **`clarify`** — pure Python router. If `ambiguous=true` or required fields are missing, routes to `ask_clarification`. No model call.
+- **`ask_clarification`** — LLM generates one focused question based on what's missing. Answer feeds back into `parse_intent` with accumulated context.
+- **`execute_tool`** — pure Python. Calls `manage_todo` with structured args from state. Stores raw result. No model call.
+- **`validate`** — Python for simple cases (deleted item absent from list, count changed as expected). LLM call only for complex cases (title match, content comparison). Stores `{"passed": bool, "mismatch": str}` in state.
+- **`fix_attempt`** — LLM diagnoses the mismatch and produces a corrected tool call. Capped at 2 retries before routing to `report_failure`.
+- **`display_result`** — pure Python formatter. No model call.
+
+**Shared state dict** flows through every node:
+
+```python
+class AgentState(TypedDict):
+    messages: list        # conversation history
+    intent: dict          # output of parse_intent
+    pending_action: dict  # args to pass to execute_tool
+    tool_result: str      # raw response from manage_todo
+    validation: dict      # {"passed": bool, "mismatch": str}
+    retry_count: int
+    final_response: str
+```
+
+**Why this is better for small models:**
+
+Each LLM call has one job, a short context (just the relevant state slice), and a small output space. A 3B model that cannot reliably orchestrate a 5-step chain *can* reliably answer "what fields are missing?" or "does this list match what was requested?" — because those are narrow classification tasks, not planning tasks.
+
+**Build order:**
+1. `parse_intent` + `clarify` router — get the clarification loop working end-to-end
+2. `execute_tool` + `display_result` — complete the happy path
+3. `validate` + `fix_attempt` — add the retry loop once the happy path is solid; log mismatches to understand what actually fails
+
+The free-form agent (web search, file writing, scripting) stays as-is alongside the state machine. Structured CRUD operations route through the graph; open-ended requests fall through to the existing loop.
 
 ---
 
